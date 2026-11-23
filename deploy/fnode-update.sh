@@ -57,6 +57,32 @@ download() {
         --proto '=https' --proto-redir '=https' --connect-timeout 10 --max-time 120 "$@"
 }
 
+find_checksum_file() {
+    local preflight command pin=""
+    local pattern='^\{ path=(/usr/bin/sha256sum|/bin/sha256sum) ; argv\[\]=(/usr/bin/sha256sum|/bin/sha256sum) (--check|-c) (/[a-zA-Z0-9._/-]+) ; ignore_errors=no ; [^{}]*\}$'
+    preflight="$(systemctl show --property=ExecStartPre --value "$service")" || return 1
+    while IFS= read -r command; do
+        [[ "$command" == *sha256sum* ]] || continue
+        if [[ -n "$pin" || ! "$command" =~ $pattern ]]; then
+            fail 'Unsupported or multiple SHA-256 checks in ExecStartPre.'
+        fi
+        [[ "${BASH_REMATCH[1]}" == "${BASH_REMATCH[2]}" ]] ||
+            fail 'Unexpected SHA-256 command in ExecStartPre.'
+        pin="${BASH_REMATCH[4]}"
+    done <<< "$preflight"
+    printf '%s' "$pin"
+}
+
+restore_files() {
+    cp -p -- "$backup" "$work/rollback" || return 1
+    if [[ -n "$checksum_file" ]]; then
+        cp -p -- "$backup_dir/fnode.sha256" "$checksum_stage" || return 1
+        systemctl stop "$service" || return 1
+        mv -fT -- "$checksum_stage" "$checksum_file" || return 1
+    fi
+    mv -fT -- "$work/rollback" "$binary"
+}
+
 cleanup() {
     local status=$? previous
     trap - EXIT
@@ -64,8 +90,7 @@ cleanup() {
     if (( rollback_needed )); then
         printf 'Update failed. Restoring fnode %s from %s\n' "$installed_version" "$backup" >&2
         previous="$(invocation_id)" || previous=""
-        if cp -p -- "$backup" "$work/rollback" &&
-            mv -fT -- "$work/rollback" "$binary" &&
+        if restore_files &&
             systemctl restart --no-block "$service" &&
             wait_for_startup "$installed_version" "$previous"; then
             printf 'Rollback succeeded. fnode %s is running.\n' "$installed_version" >&2
@@ -74,6 +99,9 @@ cleanup() {
             printf 'Rollback could not be confirmed. Backup: %s\n' "$backup" >&2
             status=2
         fi
+    fi
+    if [[ -n "$checksum_stage" ]]; then
+        rm -f -- "$checksum_stage"
     fi
     rm -rf -- "$work"
     exit "$status"
@@ -93,7 +121,7 @@ case "$(uname -m)" in
     *) fail 'Unsupported node architecture.' ;;
 esac
 
-for tool in awk chmod chown cmp cp curl date flock journalctl jq mktemp mv sha256sum sort systemctl; do
+for tool in awk chmod chown cmp cp curl date flock journalctl jq mktemp mv realpath sha256sum sort systemctl; do
     command -v "$tool" >/dev/null || fail "Missing required command: $tool"
 done
 
@@ -121,7 +149,21 @@ version_order="$(printf '%s\n' "$installed_version" "$target_version" | sort -V)
 [[ "$original_logs" == *"Running metrics task"* ]] ||
     fail 'The running fnode has no startup confirmation in the journal.'
 
+checksum_file="$(find_checksum_file)"
+if [[ -n "$checksum_file" ]]; then
+    [[ -f "$checksum_file" && ! -L "$checksum_file" &&
+        "$checksum_file" == "$(realpath -- "$checksum_file")" ]] ||
+        fail 'Expected a regular checksum file at the absolute ExecStartPre path.'
+    pinned_checksum="$(< "$checksum_file")"
+    pinned_line='^[[:xdigit:]]{64} [ *]/opt/fnode/fnode$'
+    [[ "$pinned_checksum" =~ $pinned_line ]] ||
+        fail 'Expected exactly one SHA-256 entry for /opt/fnode/fnode.'
+    sha256sum --check --strict --status "$checksum_file" ||
+        fail 'The installed fnode does not match the pinned SHA-256.'
+fi
+
 work="$(mktemp -d /opt/fnode/.fnode-update.XXXXXXXX)"
+checksum_stage=""
 rollback_needed=0
 trap cleanup EXIT
 trap 'exit 129' HUP
@@ -155,7 +197,27 @@ chown --reference="$binary" -- "$work/fnode"
 chmod --reference="$binary" -- "$work/fnode"
 printf 'Backup: %s\n' "$backup"
 
+if [[ -n "$checksum_file" ]]; then
+    [[ "$(find_checksum_file)" == "$checksum_file" &&
+        "$(< "$checksum_file")" == "$pinned_checksum" ]] ||
+        fail 'The ExecStartPre checksum changed while the release was downloading.'
+    printf '%s  %s\n' "${pinned_checksum%% *}" "$backup" | sha256sum --check --status ||
+        fail 'The backup does not match the pinned SHA-256.'
+    cp -p -- "$checksum_file" "$backup_dir/fnode.sha256"
+    cmp -s -- "$checksum_file" "$backup_dir/fnode.sha256" ||
+        fail "Could not verify the checksum backup in $backup_dir."
+    checksum_stage="$(mktemp "${checksum_file%/*}/.fnode-checksum.XXXXXXXX")"
+    printf '%s  %s\n' "${digest#sha256:}" "$binary" > "$checksum_stage"
+    chown --reference="$checksum_file" -- "$checksum_stage"
+    chmod --reference="$checksum_file" -- "$checksum_stage"
+    printf 'Checksum backup: %s/fnode.sha256 (for %s)\n' "$backup_dir" "$checksum_file"
+fi
+
 rollback_needed=1
+if [[ -n "$checksum_file" ]]; then
+    systemctl stop "$service"
+    mv -fT -- "$checksum_stage" "$checksum_file"
+fi
 mv -fT -- "$work/fnode" "$binary"
 systemctl restart --no-block "$service"
 wait_for_startup "$target_version" "$original_id"
